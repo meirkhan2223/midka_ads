@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """ADS Midterm Judge. Іске қосу: python3 judge.py  -> http://localhost:8000
 Керек: Python 3.8+, C++ үшін g++ (орнатылған болуы керек)."""
-import re, random, math, sys, os, json, subprocess, tempfile, time, shutil, webbrowser
+import threading, base64, re, random, math, sys, os, json, subprocess, tempfile, time, shutil, webbrowser
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 TL = 3  # time limit, секунд
+SHARED = bool(os.environ.get('PORT'))  # хостингте: тарих әр адамның өз браузерінде сақталады
+RUN_LOCK = threading.Lock()  # бір уақытта бір ғана код тексеріледі (уақыт дұрыс өлшенуі үшін)
 ints = lambda s: list(map(int, s.split()))
 L = lambda a: ' '.join(map(str, a))
 def size(r, k, lo, hi, mx): return lo if k == 1 else (r.randint(lo, hi) if k == 0 else mx)
@@ -386,6 +388,41 @@ def rc_hint(rc):
             'SIGFPE': 'Нөлге бөлу (division by zero) немесе integer overflow.',
             'SIGABRT': 'Abort: exception (vector.at, bad_alloc) немесе assert.'}.get(name, f'Программа exit code {rc} қайтарды (main соңында return 0 болуы керек).')
 
+CAT = ['sample', 'sample', 'random', 'random', 'random', 'edge', 'edge', 'max', 'max', 'max']
+def cut(x, n=1200): return x if len(x) <= n else x[:n] + f'\n… (қысқартылды, барлығы {len(x)} таңба)'
+WRAP = r"""
+import os, sys, time, json
+cmd = json.loads(sys.argv[1]); lim = float(sys.argv[2]); t = time.time()
+pid = os.fork()
+if pid == 0:
+    os.execvp(cmd[0], cmd)
+to = 0
+while True:
+    p, st, ru = os.wait4(pid, os.WNOHANG)
+    if p: break
+    if time.time() - t > lim:
+        os.kill(pid, 9); p, st, ru = os.wait4(pid, 0); to = 1; break
+    time.sleep(0.002)
+rc = -os.WTERMSIG(st) if os.WIFSIGNALED(st) else os.WEXITSTATUS(st)
+open(sys.argv[3], 'w').write(json.dumps([rc, ru.ru_utime + ru.ru_stime, time.time() - t, ru.ru_maxrss, to]))
+"""
+def run_one(cmd, inp, d):
+    """-> rc, stdout, stderr, cpu_sec, real_sec, mem_bytes|None, timed_out"""
+    fi, fo, fe, fr = (os.path.join(d, n) for n in ('in.txt', 'out.txt', 'err.txt', 'res.json'))
+    open(fi, 'w', encoding='utf-8').write(inp); t = time.time()
+    rd = lambda f: open(f, encoding='utf-8', errors='replace').read()
+    if hasattr(os, 'wait4'):
+        # өлшеуді шағын көмекші процесс жасайды, сондықтан сервердің өз жады нәтижеге араласпайды
+        with open(fi, 'rb') as a, open(fo, 'wb') as b, open(fe, 'wb') as c:
+            subprocess.run([sys.executable, '-S', '-E', '-c', WRAP, json.dumps(cmd), str(TL), fr], stdin=a, stdout=b, stderr=c, timeout=TL + 20)
+        rc, cpu, real, mx, to = json.load(open(fr))
+        return rc, rd(fo), rd(fe), cpu, real, (mx if sys.platform == 'darwin' else mx * 1024), bool(to)
+    try:  # Windows: жад өлшенбейді
+        r = subprocess.run(cmd, input=inp, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=TL)
+        dt = time.time() - t; return r.returncode, r.stdout, r.stderr, dt, dt, None, False
+    except subprocess.TimeoutExpired:
+        return 0, '', '', TL, TL, None, True
+
 def run_tests(pid, lang, code):
     p = PB[pid]; d = tempfile.mkdtemp()
     try:
@@ -405,28 +442,28 @@ def run_tests(pid, lang, code):
             except SyntaxError as e:
                 return {'ce': f'SyntaxError: {e.msg}\n  жол {e.lineno}: {(e.text or "").strip()}', 'cel': [e.lineno or 1]}
             src = os.path.join(d, 'a.py'); open(src, 'w', encoding='utf-8').write(code); cmd = [sys.executable, src]
-        res = []; shown = False
+        res = []
         for i, (inp, out) in enumerate(p['tests']):
-            t = time.time(); got = ''; err = ''; hint = ''; line = None; dm = ''
-            try:
-                r = subprocess.run(cmd, input=inp, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=TL)
-                dt = time.time() - t; got = r.stdout; ef = clean(r.stderr, d); err = ef[-600:]
-                if r.returncode:
-                    v = 'RE'
-                    if lang == 'py':
-                        m = re.findall(r'a\.py", line (\d+)', ef); line = int(m[-1]) if m else None
-                        lines = [x for x in ef.strip().splitlines() if x.strip()]; hint = lines[-1] if lines else 'Runtime error'
-                    else: hint = rc_hint(r.returncode)
-                elif same(got, out): v = 'AC'
-                else: v = 'WA'; dm = diff(got, out)
-            except subprocess.TimeoutExpired:
-                v = 'TLE'; dt = TL
+            rc, got, ef, cpu, real, mem, to = run_one(cmd, inp, d); ef = clean(ef, d)
+            hint = dm = ''; line = None
+            if to:
+                v = 'TLE'; info = f'time limit exceeded ({TL} s)'
                 hint = f'Time limit {TL}s асты (тест {i+1}). Алгоритм тым баяу (мысалы O(n²)), шексіз цикл немесе кіріс күтіп тұр.'
-            e = {'n': i + 1, 'v': v, 't': round(dt, 2)}
-            if v != 'AC' and not shown:
-                shown = True
-                e.update(got=trunc(got, 300), err=err, hint=hint, diff=dm, inp=trunc(inp, 400), inpcut=len(inp) > 400, exp=trunc(out, 300))
-                if line: e['line'] = line
+            elif rc:
+                v = 'RE'
+                if lang == 'py':
+                    m = re.findall(r'a\.py", line (\d+)', ef); line = int(m[-1]) if m else None
+                    ls = [x for x in ef.strip().splitlines() if x.strip()]; hint = ls[-1] if ls else 'Runtime error'
+                else: hint = rc_hint(rc)
+                info = 'run-time error: ' + hint
+            elif mem and mem > 256 * 2**20:
+                v = 'MLE'; info = f'memory limit exceeded ({mem // 2**20} MB > 256 MB)'; hint = info
+            elif same(got, out): v = 'AC'; info = f'ok {len(got.split())} numbers'
+            else: v = 'WA'; dm = diff(got, out); info = 'wrong answer: ' + dm
+            e = {'n': i + 1, 'v': v, 't': round(cpu, 3), 'rt': round(real, 3), 'mem': mem, 'info': info, 'cat': CAT[i] if i < len(CAT) else '',
+                 'inp': cut(inp), 'isz': len(inp.encode()), 'out': cut(got), 'osz': len(got.encode()), 'exp': cut(out), 'esz': len(out.encode()),
+                 'err': ef[-500:], 'hint': hint, 'diff': dm}
+            if line: e['line'] = line
             res.append(e)
         return {'res': res}
     finally:
@@ -438,19 +475,32 @@ class H(BaseHTTPRequestHandler):
     def send(self, body, ct='application/json'):
         b = body.encode('utf-8'); self.send_response(200); self.send_header('Content-Type', ct + '; charset=utf-8')
         self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+    def authed(self):
+        pw = os.environ.get('JUDGE_PASSWORD')
+        if not pw: return True
+        try: ok = base64.b64decode(self.headers.get('Authorization', 'Basic ')[6:]).decode().split(':', 1)[1] == pw
+        except Exception: ok = False
+        if not ok:
+            self.send_response(401); self.send_header('WWW-Authenticate', 'Basic realm="ADS Judge"'); self.send_header('Content-Length', '0'); self.end_headers()
+        return ok
     def do_GET(self):
+        if not self.authed(): return
         if self.path == '/api/p':
             self.send(json.dumps([dict(id=i, grp=PB[i]['grp'], title=PB[i]['title'], lvl=PB[i]['lvl'], topic=PB[i]['topic'], text=PB[i]['text'], kz=KZ.get(i, ''),
                                        ex=[{'i': a, 'o': b} for a, b in PB[i]['tests'][:2]]) for i in ORDER]))
         elif self.path == '/api/h':
-            self.send(open(HIST, encoding='utf-8').read() if os.path.exists(HIST) else '{}')
+            self.send(open(HIST, encoding='utf-8').read() if (os.path.exists(HIST) and not SHARED) else '{}')
         else: self.send(HTML, 'text/html')
     def do_POST(self):
+        if not self.authed(): return
         body = self.rfile.read(int(self.headers['Content-Length']))
         if self.path == '/api/h':
-            open(HIST, 'w', encoding='utf-8').write(body.decode('utf-8')); self.send('{}'); return
+            
+            if not SHARED: open(HIST, 'w', encoding='utf-8').write(body.decode('utf-8'))
+            self.send('{}'); return
         q = json.loads(body)
-        self.send(json.dumps(run_tests(q['pid'], q['lang'], q['code'])))
+        with RUN_LOCK: res = run_tests(q['pid'], q['lang'], q['code'])
+        self.send(json.dumps(res))
 
 HTML = r"""<!doctype html><html lang="kk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ADS Midterm Judge</title><style>
@@ -476,6 +526,7 @@ button{background:linear-gradient(#80b4f0,#5e9be0);border:1px solid #5a86b8;colo
 .b{font-size:12px;border:1px solid #888;border-radius:9px;padding:1px 8px;margin-right:6px;background:#fff}
 .ex{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;max-width:900px}
 .cv{white-space:pre;overflow-x:auto;max-width:900px}.cv span{display:block}.cv i{display:inline-block;width:38px;color:#888;font-style:normal}.cv .er{background:#f5b5b5}
+table.rt{border-collapse:collapse;background:#fff;font-size:14px}table.rt td,table.rt th{border:1px solid #000;padding:2px 6px;text-align:left}pre.tt{background:#fff;border:0;font:13px ui-monospace,Menlo,monospace;max-width:1000px;overflow-x:auto;white-space:pre-wrap}.tt u{display:inline-block;margin-top:4px}
 footer{padding:14px 24px;font-size:13px;color:#444}
 .CodeMirror{height:430px;width:min(900px,100%);border:1px solid #5a86b8;font:14px ui-monospace,Menlo,monospace;line-height:1.45}.CodeMirror-focused{box-shadow:0 0 0 2px #7db3ee}
 </style>
@@ -490,8 +541,8 @@ const $=s=>document.querySelector(s),esc=s=>String(s).replace(/&/g,'&amp;').repl
 let P=[],tab='info',arg=null,busy=false;
 const D={runs:[],next:1,c:{},name:"Байдулла Мейірхан",lang:"cpp",pid:null};let lastId=null,tm;
 let S=Object.assign({},D,JSON.parse(localStorage.ads2||'{}'));
-const save=()=>{localStorage.ads2=JSON.stringify(S);clearTimeout(tm);tm=setTimeout(()=>fetch('/api/h',{method:'POST',body:JSON.stringify(S)}),400)};
-const LAB={AC:'OK',WA:'Wrong answer',RE:'Run-time error',TLE:'Time-limit exceeded'},LN={py:'python',cpp:'g++'};
+const save=()=>{try{localStorage.ads2=JSON.stringify(S)}catch(e){}clearTimeout(tm);tm=setTimeout(()=>fetch('/api/h',{method:'POST',body:JSON.stringify(S)}),400)};
+const LAB={AC:'OK',WA:'Wrong answer',RE:'Run-time error',TLE:'Time-limit exceeded',MLE:'Memory limit exceeded'},LN={py:'python',cpp:'g++'};
 const TPL={py:'import sys\ninput = sys.stdin.readline\n\n# код мұнда\n',cpp:'#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n    // код мұнда\n    return 0;\n}\n'};
 const NAV=[['info','Info'],['summary','Summary'],['submissions','Submissions'],['standings','Standings'],['settings','Settings']];
 const fmt=d=>new Date(d).toLocaleString('sv-SE');
@@ -533,16 +584,16 @@ async function submit(){if(busy)return;busy=true;$('#sb').disabled=true;$('#st')
  S.runs.unshift(rn);save();lastId=rn.id;tab='info';arg=pid;render();$('#res').scrollIntoView()}
 const loadCode=id=>{const r=run(id);S.pid=r.pid;S.lang=r.lang;S.c[r.pid+r.lang]=r.code;save();go('info',r.pid)};
 const codeView=(c,ls)=>`<pre class="cv">`+c.split('\n').map((l,i)=>`<span class="${ls.includes(i+1)?'er':''}"><i>${i+1}</i>${esc(l)||' '}</span>`).join('')+`</pre>`;
+const goT=n=>document.getElementById('t'+n).scrollIntoView();
 function reportBody(r){let h=`<p>Problem <b>${r.pid}</b>, ${LN[r.lang]}, ${fmt(r.time)}: <b style="color:${r.result=='OK'?'#2b7a2b':'#b02020'}">${r.result}</b>${r.ce?'':` — өткен тест: ${passed(r)}/10, баға: ${passed(r)*10}%`}</p>`;
  if(r.ce)return h+`<h3>Compilation error</h3><pre>${esc(r.ce)}</pre>`+(r.cel.length?`<p>Қате жолдар: <b>${r.cel.join(', ')}</b></p>`:'')+codeView(r.code,r.cel);
- h+=`<table class="t"><tr><th>Test</th><th>Result</th><th>Time</th></tr>`+r.tests.map(t=>`<tr class="${t.v=='AC'?'ok':'bad'}"><td>${t.n}</td><td>${LAB[t.v]}</td><td>${t.t}s</td></tr>`).join('')+`</table>`;
  const f=r.tests.find(t=>t.v!='AC');
- if(f){h+=`<h3>Қате: test ${f.n} — ${LAB[f.v]}</h3>`;
-  if(f.hint)h+=`<p><b>${esc(f.hint)}</b></p>`;if(f.diff)h+=`<p>⚠ ${esc(f.diff)}</p>`;
-  if(f.line)h+=`<p>Қате жол: <b>${f.line}</b></p>`;
-  h+=`<b>Input${f.inpcut?' (қысқартылған)':''}:</b><pre>${esc(f.inp)}</pre><b>Expected:</b><pre>${esc(f.exp)}</pre><b>Your output:</b><pre>${esc(f.got||'(бос)')}</pre>`;
-  if(f.err)h+=`<b>stderr:</b><pre>${esc(f.err)}</pre>`;
-  if(f.line)h+=codeView(r.code,[f.line])}
+ if(f){h+=`<h3>Қате талдауы: test ${f.n} — ${LAB[f.v]}</h3>`;if(f.hint)h+=`<p><b>${esc(f.hint)}</b></p>`;if(f.diff)h+=`<p>⚠ ${esc(f.diff)}</p>`;
+  if(f.line)h+=`<p>Қате жол: <b>${f.line}</b></p>`+codeView(r.code,[f.line])}
+ h+=`<table class="rt"><tr><th>N</th><th>Result</th><th>Time (sec)</th><th>Real time (sec)</th><th>Max memory used</th><th>Extra info</th><th>Link</th></tr>`+
+  r.tests.map(t=>`<tr><td>${t.n}</td><td style="color:${t.v=='AC'?'#1a7a1a':'#c00'}">${t.v=='AC'?'OK':LAB[t.v]}</td><td>${t.t}</td><td>${t.rt??''}</td><td>${t.mem??'—'}</td><td>${esc(t.info??'')}</td><td>${['I','O','A','E','C','F'].map(c=>`<a onclick="goT(${t.n})">${c}</a>`).join(' ')}</td></tr>`).join('')+`</table>`+
+  `<p style="line-height:1.7">I Test input<br>O Program output<br>A Correct output<br>E Program output to stderr<br>C Checker output<br>F Additional test information</p>`+
+  r.tests.map(t=>`<pre class="tt" id="t${t.n}"><b>====== Test #${t.n} =======</b>\n<u>--- Input: size ${t.isz??''} ---</u>\n${esc(t.inp??'')}\n\n<u>--- Output: size ${t.osz??''} ---</u>\n${esc(t.out??t.got??'')}\n\n<u>--- Correct: size ${t.esz??''} ---</u>\n${esc(t.exp??'')}\n`+(t.err?`\n<u>--- Stderr ---</u>\n${esc(t.err)}\n`:'')+`\n<u>--- Checker output ---</u>\n${esc(t.info??'')}\n\n<u>--- Additional info ---</u>\nCategory: ${t.cat??''}</pre>`).join('');
  return h}
 function summary(){return `<div class="sec">Problem status summary</div><table class="t"><tr><th>Short name</th><th>Long name</th><th>Status</th><th>Failed test</th><th>Run ID</th></tr>`+
  P.map(p=>{const rs=S.runs.filter(r=>r.pid==p.id),ok=rs.find(r=>r.result=='OK'),r=ok||rs[0];
@@ -562,8 +613,9 @@ Promise.all([fetch('/api/p').then(r=>r.json()),fetch('/api/h').then(r=>r.json())
 </script></body></html>"""
 
 if __name__ == '__main__':
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    print(f"Judge іске қосылды: http://localhost:{port}  (тоқтату: Ctrl+C)")
-    try: webbrowser.open(f"http://localhost:{port}")
-    except Exception: pass
-    ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
+    port = int(os.environ.get('PORT') or (sys.argv[1] if len(sys.argv) > 1 else 8000))
+    print(f"Judge іске қосылды: http://localhost:{port}  (тоқтату: Ctrl+C)", flush=True)
+    if not SHARED:
+        try: webbrowser.open(f"http://localhost:{port}")
+        except Exception: pass
+    ThreadingHTTPServer(('0.0.0.0' if SHARED else '127.0.0.1', port), H).serve_forever()
